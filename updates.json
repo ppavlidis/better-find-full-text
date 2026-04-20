@@ -1,0 +1,12 @@
+{
+	"addons": {
+		"better-find-full-text@example.com": {
+			"updates": [
+				{
+					"version": "1.0.0",
+					"update_link": "https://github.com/ppavlidis/better-find-full-text/releases/download/v1.0.0/better-find-full-text.xpi"
+				}
+			]
+		}
+	}
+}

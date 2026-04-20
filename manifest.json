@@ -1,0 +1,18 @@
+{
+	"manifest_version": 2,
+	"name": "Better Find Full Text",
+	"version": "1.0.0",
+	"description": "Finds full text and snapshots for Zotero items, using the built-in PDF finder first, then falling back to direct download, USPTO, Google Patents, and paywall-assisted snapshots.",
+	"icons": {
+		"48": "content/icons/favicon.svg",
+		"96": "content/icons/favicon.svg"
+	},
+	"applications": {
+		"zotero": {
+			"id": "better-find-full-text@example.com",
+			"update_url": "https://raw.githubusercontent.com/ppavlidis/better-find-full-text/main/updates.json",
+			"strict_min_version": "7.0.0",
+			"strict_max_version": "9.*"
+		}
+	}
+}
