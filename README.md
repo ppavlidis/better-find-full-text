@@ -32,9 +32,9 @@ Fetches the article page and checks whether `citation_pdf_url` — a metadata ta
 When an article is paywalled, the plugin:
 
 1. Opens the article page in your browser (using the canonical DOI URL so the browser follows the publisher's redirect chain with its own cookies)
-2. Shows a non-blocking notification in Zotero: *"N paywalled items opened in browser — click the Zotero Connector for each one"*
+2. Shows a non-blocking notification in Zotero: *"N paywalled items opened in browser. If needed, complete your institutional or publisher login, then click the Zotero Connector to save the PDF."*
 
-In your browser, navigate to the full article (log in if needed), then click the **Zotero Connector** button. This normally creates a duplicate record in Zotero — but the plugin detects it automatically and merges it:
+In your browser, complete any required login (institutional proxy, publisher account, etc.) so you can see the full article, then click the **Zotero Connector** button. This normally creates a duplicate record in Zotero — but the plugin detects it automatically and merges it:
 
 - Attachments (PDF, snapshot) are moved to your existing item
 - The duplicate record is silently deleted

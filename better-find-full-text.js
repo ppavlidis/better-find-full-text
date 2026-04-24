@@ -242,8 +242,9 @@ var BetterFindFullText = {
 			const n = paywalled.length;
 			pw.addDescription(
 				`${n} paywalled item${n > 1 ? "s" : ""} opened in browser.\n` +
-				`Click the Zotero Connector for each one — duplicates will be\n` +
-				`auto-merged into your existing items.`
+				`If needed, complete your institutional or publisher login,\n` +
+				`then click the Zotero Connector to save the PDF. Duplicates\n` +
+				`will be auto-merged into your existing items.`
 			);
 		}
 		pw.startCloseTimer(paywalled.length ? 12000 : 4000);

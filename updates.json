@@ -5,6 +5,10 @@
 				{
 					"version": "1.0.0",
 					"update_link": "https://github.com/ppavlidis/better-find-full-text/releases/download/v1.0.0/better-find-full-text.xpi"
+				},
+				{
+					"version": "1.0.1",
+					"update_link": "https://github.com/ppavlidis/better-find-full-text/releases/download/v1.0.1/better-find-full-text.xpi"
 				}
 			]
 		}
