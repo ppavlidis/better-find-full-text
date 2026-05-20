@@ -262,10 +262,17 @@ var BetterFindFullText = {
 		const typeName  = Zotero.ItemTypes.getName(item.itemTypeID);
 		const isPatent  = this.PATENT_TYPES.has(typeName);
 		const isJournal = this.JOURNAL_TYPES.has(typeName);
-		const doi = item.getField("DOI");
+		const doiField = item.getField("DOI");
 		const url = item.getField("url");
 
-		log(`Processing "${item.getDisplayTitle()}" (${typeName}, doi=${doi||"none"}, url=${url||"none"}${force ? ", force" : ""})`);
+		// Many records carry PMID / PMCID / DOI in the Extra field (Zotero's
+		// convention for IDs without a dedicated field) rather than in
+		// item.DOI. Pull them out — we use the PMC IDs as a separate fetch
+		// hook below, and the extra-DOI as a backfill when item.DOI is empty.
+		const extraIds = this._extractExtraIds(item, url);
+		const doi = doiField || extraIds.doi || "";
+
+		log(`Processing "${item.getDisplayTitle()}" (${typeName}, doi=${doi||"none"}, url=${url||"none"}, pmid=${extraIds.pmid||"none"}, pmcid=${extraIds.pmcid||"none"}${force ? ", force" : ""})`);
 
 		// Skip if a real PDF is already on disk, unless force is set. With
 		// force we try anyway — if that ends up duplicating an existing PDF,
@@ -282,8 +289,25 @@ var BetterFindFullText = {
 		// 3. Patent-specific fallback.
 		if (isPatent) return await this._fetchPatent(item, paywalled);
 
+		// 4. PubMed / PMC hooks. Useful in two cases:
+		//   - The item lacks DOI and URL but Extra has PMID/PMCID.
+		//   - The item has a paywalled DOI, but a free PMC version exists
+		//     that Unpaywall happens to have missed.
+		//
+		// _fetchByPubMedIds mutates extraIds to backfill any DOI it learns
+		// from NCBI (e.g., the arXiv / bioRxiv / medRxiv DOI for a preprint
+		// indexed only by PMID). We re-read extraIds.doi below so that
+		// DOI can drive the normal journal-article fetch flow — which is
+		// how arXiv / bioRxiv get picked up: doi.org → preprint page →
+		// citation_pdf_url.
+		if (extraIds.pmid || extraIds.pmcid) {
+			const result = await this._fetchByPubMedIds(item, extraIds);
+			if (result === "pdf") return "pdf";
+		}
+
 		// Need at least a URL or DOI to go further.
-		const rawUrl = url || (doi ? `https://doi.org/${doi}` : null);
+		const effectiveDoi = doi || extraIds.doi || "";
+		const rawUrl = url || (effectiveDoi ? `https://doi.org/${effectiveDoi}` : null);
 		if (!rawUrl) {
 			log(`No URL or DOI — skipping`);
 			return "skipped";
@@ -574,6 +598,191 @@ var BetterFindFullText = {
 			.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "");
 		if (doi) return `https://doi.org/${doi}`;
 		return item.getField("url") || null;
+	},
+
+	// Pull PMID / PMCID / DOI out of the Extra field (Zotero's catch-all for
+	// IDs not represented by a dedicated field). Also picks up a PMID
+	// embedded in the URL field, since records imported from PubMed often
+	// land there. Returns { pmid, pmcid, doi } with missing values omitted.
+	_extractExtraIds(item, url) {
+		const out = {};
+		const extra = item.getField("extra") || "";
+
+		// Match line-anchored "PMID: 12345678" and "PubMed ID: 12345678".
+		let m = extra.match(/(?:^|\n)\s*(?:PMID|PubMed[- ]?ID)\s*:\s*(\d{4,9})/i);
+		if (m) out.pmid = m[1];
+
+		// PMCID: PMC1234567
+		m = extra.match(/(?:^|\n)\s*PMCID\s*:\s*(PMC\d+)/i);
+		if (m) out.pmcid = m[1].toUpperCase();
+
+		// DOI: 10.xxxx/yyyy — Zotero stores DOIs on items that have a DOI
+		// field via that field, but book chapters, theses, etc. carry DOI
+		// only in Extra. Strip a stray trailing punctuation char that often
+		// gets pasted along with the DOI.
+		m = extra.match(/(?:^|\n)\s*DOI\s*:\s*(10\.\S+)/i);
+		if (m) out.doi = m[1].replace(/[).,;]+$/, "");
+
+		// PubMed URL in the URL field — e.g. an item dragged in from a
+		// PubMed search where no other identifier got populated.
+		if (!out.pmid && url) {
+			const um = url.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d{4,9})/i)
+				|| url.match(/ncbi\.nlm\.nih\.gov\/pubmed\/(\d{4,9})/i);
+			if (um) out.pmid = um[1];
+		}
+
+		return out;
+	},
+
+	// Try to pull a PDF using NCBI / PMC / EuropePMC hooks, in order:
+	//   1. PMC OA PDF endpoint, if we already have a PMCID — these are
+	//      guaranteed open-access full text and the cheapest hop.
+	//   2. EuropePMC search by PMID — covers PMC content, additional OA
+	//      sources, and preprint servers (bioRxiv, medRxiv, arXiv via
+	//      SRC:PPR). Returns a structured fullTextUrlList with availability
+	//      codes so we can pick OA/free URLs and skip subscription ones.
+	//   3. NCBI ID converter — used as a last-resort backfill of DOI / PMCID
+	//      when nothing above worked. The caller will use the backfilled DOI
+	//      to drive the normal DOI-based fetch flow.
+	// Returns "pdf" on success, or null. ids is mutated to backfill any
+	// identifiers we learn along the way.
+	async _fetchByPubMedIds(item, ids) {
+		if (ids.pmcid) {
+			// /pdf/ on PMC redirects to the actual PDF blob. Some HEAD probes
+			// come back as text/html (the redirect landing) even when the
+			// final blob is a PDF, so just attempt the import and let the
+			// magic-byte check in _hasPDF catch false positives.
+			const pdfUrl = `https://www.ncbi.nlm.nih.gov/pmc/articles/${ids.pmcid}/pdf/`;
+			log(`Trying PMC OA PDF: ${pdfUrl}`);
+			try {
+				await this._importFile(pdfUrl, item, "application/pdf");
+				if (await this._hasPDF(item)) {
+					log(`PMC OA PDF import succeeded for ${ids.pmcid}`);
+					return "pdf";
+				}
+				log(`PMC OA PDF import returned a non-PDF — removing`);
+				await this._removeLastAttachment(item);
+			} catch (e) {
+				log(`PMC OA PDF import failed for ${ids.pmcid}: ${e}`);
+			}
+		}
+
+		if (ids.pmid) {
+			const result = await this._fetchByEuropePMC(item, ids);
+			if (result === "pdf") return "pdf";
+		}
+
+		// Last-resort DOI backfill via NCBI's ID converter. EuropePMC
+		// usually returns the DOI already (stashed into ids by
+		// _fetchByEuropePMC), so this only runs when EuropePMC had no
+		// record at all — typical for very recent PMIDs not yet ingested
+		// into EuropePMC's index.
+		if (ids.pmid && !ids.doi && !ids.pmcid) {
+			const lookupUrl = `https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids=${encodeURIComponent(ids.pmid)}&format=json&tool=better-find-full-text&email=better-find-full-text@example.com`;
+			try {
+				const xhr = await Zotero.HTTP.request("GET", lookupUrl, { timeout: 12000 });
+				const json = JSON.parse(xhr.responseText || "{}");
+				const rec = (json.records || [])[0] || {};
+				if (rec.pmcid) ids.pmcid = String(rec.pmcid).toUpperCase();
+				if (rec.doi)   ids.doi   = String(rec.doi);
+				log(`PMID ${ids.pmid} resolved via ID converter → ${JSON.stringify({pmcid: ids.pmcid, doi: ids.doi})}`);
+				// If the converter discovered a PMCID that EuropePMC didn't
+				// know about, retry the PMC PDF hop now.
+				if (ids.pmcid) return await this._fetchByPubMedIds(item, ids);
+			} catch (e) {
+				log(`NCBI ID converter failed for PMID ${ids.pmid}: ${e}`);
+			}
+		}
+
+		return null;
+	},
+
+	// Query the EuropePMC search API for a PMID and try its open-access
+	// full-text URLs in availability order. Also backfills ids.doi /
+	// ids.pmcid from the record when present.
+	//
+	// EuropePMC's fullTextUrlList entries each carry:
+	//   - availability:    human-readable ("Open access", "Subscription required")
+	//   - availabilityCode: short code — OA (open access), F (free),
+	//                       RF (restricted free), S (subscription required)
+	//   - documentStyle:    "pdf" or "html"
+	//   - site / url
+	// We attempt OA → F → RF in order, skipping S entirely.
+	async _fetchByEuropePMC(item, ids) {
+		// SRC:MED  → PubMed records (PMID lookups by EXT_ID)
+		// SRC:PPR  → preprints (bioRxiv, medRxiv, arXiv life-sci, etc.)
+		// SRC:PMC  → PMC (in case the PMID also has a PMC source row)
+		const query = `EXT_ID:${ids.pmid} AND (SRC:MED OR SRC:PPR OR SRC:PMC)`;
+		const apiUrl = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(query)}&format=json&resultType=core`;
+
+		let rec;
+		try {
+			const xhr = await Zotero.HTTP.request("GET", apiUrl, { timeout: 12000 });
+			const json = JSON.parse(xhr.responseText || "{}");
+			rec = (json.resultList?.result || [])[0];
+		} catch (e) {
+			log(`EuropePMC search failed for PMID ${ids.pmid}: ${e}`);
+			return null;
+		}
+
+		if (!rec) {
+			log(`EuropePMC has no record for PMID ${ids.pmid}`);
+			return null;
+		}
+
+		// Backfill identifiers learned from EuropePMC so downstream code
+		// (and the ID-converter fallback) can use them.
+		if (rec.doi && !ids.doi) {
+			ids.doi = String(rec.doi);
+			log(`EuropePMC backfilled DOI for PMID ${ids.pmid}: ${ids.doi}`);
+		}
+		if (rec.pmcid && !ids.pmcid) {
+			ids.pmcid = String(rec.pmcid).toUpperCase();
+			log(`EuropePMC backfilled PMCID for PMID ${ids.pmid}: ${ids.pmcid}`);
+		}
+
+		const priority = { OA: 0, F: 1, RF: 2 };
+		const candidates = (rec.fullTextUrlList?.fullTextUrl || [])
+			.filter(u => u.documentStyle === "pdf")
+			.filter(u => u.availabilityCode in priority)
+			.sort((a, b) => priority[a.availabilityCode] - priority[b.availabilityCode]);
+
+		log(`EuropePMC: ${candidates.length} OA/free PDF candidate(s) for PMID ${ids.pmid}`);
+
+		for (const u of candidates) {
+			log(`Trying EuropePMC PDF [${u.availabilityCode} ${u.site || ""}]: ${u.url}`);
+			try {
+				await this._importFile(u.url, item, "application/pdf");
+				if (await this._hasPDF(item)) {
+					log(`EuropePMC PDF import succeeded`);
+					return "pdf";
+				}
+				log(`EuropePMC import was not a valid PDF — removing`);
+				await this._removeLastAttachment(item);
+			} catch (e) {
+				log(`EuropePMC PDF import failed (${u.url}): ${e}`);
+			}
+		}
+
+		// If EuropePMC has the record but only as a PMCID-style PDF render
+		// link that wasn't returned in fullTextUrlList, try the canonical
+		// EuropePMC PDF render endpoint directly.
+		if (ids.pmcid) {
+			const pdfUrl = `https://europepmc.org/articles/${ids.pmcid}?pdf=render`;
+			log(`Trying EuropePMC canonical render: ${pdfUrl}`);
+			try {
+				await this._importFile(pdfUrl, item, "application/pdf");
+				if (await this._hasPDF(item)) {
+					log(`EuropePMC canonical render succeeded`);
+					return "pdf";
+				}
+				await this._removeLastAttachment(item);
+			} catch (e) {
+				log(`EuropePMC canonical render failed: ${e}`);
+			}
+		}
+
+		return null;
 	},
 
 	// Returns true if the URL path indicates the page is an abstract-only /
