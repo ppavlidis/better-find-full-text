@@ -13,6 +13,14 @@ async function startup({ id, version, rootURI }) {
 	Services.scriptloader.loadSubScript(rootURI + "better-find-full-text.js");
 	BetterFindFullText.init({ id, version, rootURI });
 	BetterFindFullText.addToAllWindows();
+
+	// Register the settings pane (Zotero → Settings → Better Find Full Text).
+	Zotero.PreferencePanes.register({
+		pluginID: id,
+		src: rootURI + "content/preferences.xhtml",
+		label: "Better Find Full Text",
+		image: rootURI + "content/icons/favicon.svg",
+	});
 }
 
 function onMainWindowLoad({ window }) {

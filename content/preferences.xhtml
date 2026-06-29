@@ -1,0 +1,23 @@
+<vbox xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+      xmlns:html="http://www.w3.org/1999/xhtml">
+	<groupbox>
+		<label><html:h2>Better Find Full Text</html:h2></label>
+
+		<hbox align="center">
+			<label flex="1" control="bfft-itemTimeoutSec">
+				Per-item timeout (seconds)
+			</label>
+			<html:input id="bfft-itemTimeoutSec"
+				type="number" min="10" max="600" style="width: 6em;"
+				preference="extensions.better-find-full-text.itemTimeoutSec" />
+		</hbox>
+
+		<description class="bfft-help">
+			How long to keep working on a single item before giving up and moving
+			on to the next one. This is a safety net: a hung download or snapshot
+			can't be cancelled mid-flight, so it stops one bad item from stalling
+			the whole batch. Leave blank to use the default of 60 seconds. Raise it
+			if you regularly pull large PDFs over a slow institutional proxy.
+		</description>
+	</groupbox>
+</vbox>

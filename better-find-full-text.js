@@ -161,6 +161,91 @@ var BetterFindFullText = {
 		return s.length <= max ? s : s.slice(0, max - 1) + "…";
 	},
 
+	// Read an integer plugin pref (full branch name = PREFS_PREFIX + key),
+	// returning the default when unset or unparseable.
+	_getIntPref(key, dflt) {
+		try {
+			const v = Zotero.Prefs.get(this.PREFS_PREFIX + key, true);
+			const n = parseInt(v, 10);
+			return Number.isFinite(n) ? n : dflt;
+		} catch (e) {
+			return dflt;
+		}
+	},
+
+	// Race a promise against a timeout. Used to put a hard ceiling on each
+	// item's processing so one hung operation can't wedge the whole batch.
+	// The underlying promise keeps running after a timeout (we can't cancel a
+	// hidden-browser snapshot mid-flight), but it no longer blocks the loop —
+	// and any attachment it eventually produces is harmless.
+	_withTimeout(promise, ms) {
+		let timer;
+		const timeout = new Promise((_, reject) => {
+			timer = setTimeout(
+				() => reject(new Error(`timed out after ${Math.round(ms / 1000)}s`)),
+				ms
+			);
+		});
+		return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+	},
+
+	// Tidy up Zotero's progress popup. Two problems, both because the popup's
+	// DOM window isn't reachable through the public API (it's a private closure
+	// var), so we locate it via the window mediator:
+	//
+	//   1. alwaysontop — show() hardcodes "alwaysontop=yes" with no opt-out, so
+	//      the popup floats above every other window (browser, other apps). We
+	//      lower its z-level from raised back to normal.
+	//   2. off-screen — Zotero computes the popup's position from its height
+	//      before content lays out, so a tall window (e.g. the final summary
+	//      with the paywall description) runs off the bottom of the screen. We
+	//      pull it back on-screen, pinned to the bottom-right with a margin, but
+	//      only when an edge is actually clipped (so a user who drags it
+	//      elsewhere on-screen isn't yanked back).
+	//
+	// Best-effort: any failure leaves the default behaviour intact rather than
+	// breaking the progress UI.
+	_fixProgressWindow() {
+		try {
+			const Ci = Components.interfaces;
+			const en = Services.wm.getEnumerator(null);
+			while (en.hasMoreElements()) {
+				const win = en.getNext();
+				let uri = "";
+				try { uri = win.location?.href || win.document?.documentURI || ""; } catch (e) {}
+				if (!/progressWindow\.xhtml/i.test(uri)) continue;
+
+				// 1. Drop always-on-top.
+				try {
+					const appWin = win.docShell.treeOwner
+						.QueryInterface(Ci.nsIInterfaceRequestor)
+						.getInterface(Ci.nsIAppWindow);
+					if (appWin.zLevel > appWin.normalZ) appWin.zLevel = appWin.normalZ;
+				} catch (e) { /* non-fatal */ }
+
+				// 2. Pull back on-screen if clipped.
+				try {
+					const sc = win.screen, margin = 20;
+					const w = win.outerWidth, h = win.outerHeight;
+					if (!w || !h) continue;
+					const availR = sc.availLeft + sc.availWidth;
+					const availB = sc.availTop + sc.availHeight;
+					const clipped =
+						win.screenX < sc.availLeft || win.screenY < sc.availTop ||
+						win.screenX + w > availR || win.screenY + h > availB;
+					if (clipped) {
+						win.moveTo(
+							Math.max(sc.availLeft, availR - w - margin),
+							Math.max(sc.availTop, availB - h - margin)
+						);
+					}
+				} catch (e) { /* non-fatal */ }
+			}
+		} catch (e) {
+			log(`Could not adjust progress window: ${e}`);
+		}
+	},
+
 	// ── Command handler ───────────────────────────────────────────────────────
 
 	async _onMenuCommand(window, { force = false } = {}) {
@@ -176,15 +261,61 @@ var BetterFindFullText = {
 		this._running = true;
 		this._cancelRequested = false;
 
-		const pw = new Zotero.ProgressWindow({ closeOnClick: true });
-		pw.changeHeadline(
-			`Better Find Full Text${force ? " (force)" : ""}: processing ${items.length} item(s)…`
-		);
+		// closeOnClick: false — with it on, any stray click anywhere on the
+		// window calls close() and the whole thing vanishes mid-batch, which is
+		// jarring. Off, the window is stable: it persists during the run and
+		// auto-dismisses via the close timer at the end (Zotero pauses that
+		// timer while the mouse is over it, so the summary stays readable). To
+		// dismiss it mid-run, use the "Cancel Better Find Full Text" menu item.
+		//
+		// Note: deliberately NOT passing { window } — doing so makes Zotero's
+		// tile() anchor the popup to the main window's bottom-right corner, which
+		// pushes it off the screen edge. The default screen-relative positioning
+		// keeps it fully visible.
+		const pw = new Zotero.ProgressWindow({ closeOnClick: false });
+		const headlineBase = `Better Find Full Text${force ? " (force)" : ""}`;
 		pw.show();
+		// show() opens the popup asynchronously (content deferred until load)
+		// with alwaysontop hardcoded and its position computed before layout.
+		// Fix z-level and on-screen position once it has been realized.
+		setTimeout(() => this._fixProgressWindow(), 150);
+		setTimeout(() => this._fixProgressWindow(), 500);
 
-		let nPdf = 0, nSnapshot = 0, nSkipped = 0, nFailed = 0, nClobbered = 0;
+		let nPdf = 0, nSnapshot = 0, nPaywall = 0, nSkipped = 0, nFailed = 0, nClobbered = 0;
 		let cancelled = false, processed = 0;
 		const paywalled = []; // { item, url } — collected for one combined prompt
+
+		// Hard per-item ceiling. importFromURL snapshots run in the hidden
+		// browser with no timeout of their own; before this guard a single hung
+		// page would stall the for-loop forever, leaving _running stuck true so
+		// that no later batch could ever start (the "does nothing after ~10
+		// items" failure). On timeout we count the item as failed and move on.
+		//
+		// This is a blanket ceiling, not a smart cancel: importFromURL exposes
+		// no progress callback, so we can't distinguish a slow-but-live download
+		// from a truly hung one. Tunable (in seconds) via the hidden pref
+		// <prefix>itemTimeoutSec for users who hit large files over slow proxies.
+		const PER_ITEM_TIMEOUT_MS = Math.max(10, this._getIntPref("itemTimeoutSec", 60)) * 1000;
+
+		// Single status line, updated in place. Using one reusable line (rather
+		// than one per item) keeps the window a fixed height regardless of batch
+		// size — a 500-item batch looks the same as a 5-item one. The headline
+		// carries the cumulative tally so the user still sees results accrue.
+		let statusLine = null;
+		try { statusLine = new pw.ItemProgress("", "Starting…"); } catch (e) {}
+
+		const renderHeadline = () => {
+			const parts = [`${nPdf} PDF`, `${nSnapshot} snapshot`, `${nPaywall} paywalled`];
+			if (nSkipped) parts.push(`${nSkipped} skipped`);
+			if (nFailed)  parts.push(`${nFailed} failed`);
+			pw.changeHeadline(
+				`${headlineBase} [${processed}/${items.length}] — ${parts.join(", ")}`
+			);
+			// Height can change as the status line / summary grows; keep it
+			// on-screen. No-op until the window has loaded.
+			this._fixProgressWindow();
+		};
+		renderHeadline();
 
 		try {
 		for (let i = 0; i < items.length; i++) {
@@ -193,25 +324,36 @@ var BetterFindFullText = {
 				break;
 			}
 			const item = items[i];
-			pw.changeHeadline(
-				`[${i + 1}/${items.length}] ${this._trimTitle(item.getDisplayTitle())}`
-			);
+			const title = this._trimTitle(item.getDisplayTitle());
+
+			if (statusLine) {
+				try { statusLine.setIcon?.(item.getImageSrc?.() || ""); } catch (e) {}
+				statusLine.setText(`[${i + 1}/${items.length}] ${title} — working…`);
+			}
+
+			let outcome;
 			try {
-				if (force) {
-					nClobbered += await this._clobberBadSnapshots(item);
-				}
-				const result = await this._fetchItem(item, paywalled, { force });
-				if      (result === "pdf")      nPdf++;
-				else if (result === "snapshot") nSnapshot++;
-				else if (result === "paywall")  {} // handled below
-				else                            nSkipped++;
-				processed++;
+				// Run clobber + fetch as one unit under the timeout watchdog.
+				const work = (async () => {
+					if (force) nClobbered += await this._clobberBadSnapshots(item);
+					return await this._fetchItem(item, paywalled, { force });
+				})();
+				const result = await this._withTimeout(work, PER_ITEM_TIMEOUT_MS);
+
+				if      (result === "pdf")      { nPdf++;      outcome = "full text (PDF) added"; }
+				else if (result === "snapshot") { nSnapshot++; outcome = "snapshot saved"; }
+				else if (result === "paywall")  { nPaywall++;  outcome = "paywalled, opening in browser"; }
+				else                            { nSkipped++;  outcome = "no full text found / skipped"; }
 				log(`${result}: "${item.getDisplayTitle()}"`);
 			} catch (e) {
 				nFailed++;
-				processed++;
+				outcome = `failed: ${e}`;
 				log(`Failed for "${item.getDisplayTitle()}": ${e}`);
 			}
+
+			processed++;
+			if (statusLine) statusLine.setText(`[${i + 1}/${items.length}] ${title} — ${outcome}`);
+			renderHeadline();
 		}
 		} finally {
 			this._running = false;
@@ -247,6 +389,10 @@ var BetterFindFullText = {
 				`will be auto-merged into your existing items.`
 			);
 		}
+		// The description grows the window; re-fix position so the summary isn't
+		// clipped at the bottom of the screen.
+		this._fixProgressWindow();
+		setTimeout(() => this._fixProgressWindow(), 150);
 		pw.startCloseTimer(paywalled.length ? 12000 : 4000);
 	},
 
@@ -1231,6 +1377,7 @@ var BetterFindFullText = {
 		);
 		pw.addDescription(canonical.getDisplayTitle().substring(0, 80));
 		pw.show();
+		setTimeout(() => this._fixProgressWindow(), 150);
 		pw.startCloseTimer(4000);
 	},
 };
