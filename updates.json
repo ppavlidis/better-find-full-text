@@ -17,6 +17,10 @@
 				{
 					"version": "1.2.0",
 					"update_link": "https://github.com/ppavlidis/better-find-full-text/releases/download/v1.2.0/better-find-full-text.xpi"
+				},
+				{
+					"version": "1.2.1",
+					"update_link": "https://github.com/ppavlidis/better-find-full-text/releases/download/v1.2.1/better-find-full-text.xpi"
 				}
 			]
 		}

@@ -1328,6 +1328,55 @@ var BetterFindFullText = {
 		}
 	},
 
+	// Copy creators and any blank scalar fields from `source` onto `target`,
+	// filling gaps only — existing data on `target` is never overwritten. Used
+	// so a sparse canonical inherits authors/metadata from the richer duplicate
+	// before the duplicate is erased. Saves `target` if anything changed.
+	async _backfillFields(source, target) {
+		try {
+			let changed = false;
+
+			// Creators (authors/editors/etc.): only fill if the canonical has none.
+			if (!target.getCreators().length) {
+				const creators = source.getCreators();
+				if (creators.length) {
+					try {
+						target.setCreators(creators);
+						changed = true;
+						log(`Backfilled ${creators.length} creator(s) onto canonical ${target.id}`);
+					} catch (e) {
+						log(`Could not copy creators onto canonical ${target.id}: ${e}`);
+					}
+				}
+			}
+
+			// Scalar fields valid for the canonical's item type: fill blanks only.
+			const fieldIDs = Zotero.ItemFields.getItemTypeFields(target.itemTypeID);
+			const filled = [];
+			for (const fieldID of fieldIDs) {
+				const name = Zotero.ItemFields.getName(fieldID);
+				if (target.getField(name)) continue;          // already has a value
+				let val = "";
+				try { val = source.getField(name); } catch (e) { continue; } // not valid for source type
+				if (!val) continue;
+				try {
+					target.setField(name, val);
+					filled.push(name);
+					changed = true;
+				} catch (e) {
+					// Field not settable on this type — skip.
+				}
+			}
+			if (filled.length) {
+				log(`Backfilled field(s) onto canonical ${target.id}: ${filled.join(", ")}`);
+			}
+
+			if (changed) await target.saveTx();
+		} catch (e) {
+			log(`Field backfill failed (${target?.id}): ${e}`);
+		}
+	},
+
 	async _doMerge(newItemId, canonicalId) {
 		const newItem   = Zotero.Items.get(newItemId);
 		const canonical = Zotero.Items.get(canonicalId);
@@ -1335,6 +1384,12 @@ var BetterFindFullText = {
 			log(`Merge aborted: item(s) no longer exist`);
 			return;
 		}
+
+		// Backfill metadata the canonical is missing from the richer duplicate
+		// (the Connector-saved item usually has full metadata; a pre-existing
+		// canonical may be a sparse record). Fill blanks only — never overwrite
+		// data the canonical already has.
+		await this._backfillFields(newItem, canonical);
 
 		const attIDs = newItem.getAttachments();
 		if (!attIDs.length) {
