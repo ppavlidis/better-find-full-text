@@ -1,6 +1,6 @@
 # Better Find Full Text
 
-A Zotero 7/8/9 plugin that goes further than the built-in "Find Available PDF" to attach full text to your library items.
+A Zotero 7/8/9/10 plugin that goes further than the built-in "Find Available PDF" to attach full text to your library items.
 
 ## Installation
 
@@ -98,5 +98,22 @@ Think of the plugin as a force multiplier for the normal Zotero + Connector work
 
 ## Requirements
 
-- Zotero 7.0, 8.x, or 9.x
+- Zotero 7.0, 8.x, 9.x, or 10.x
 - [Zotero Connector](https://www.zotero.org/download/connectors) browser extension (for the paywall workflow)
+
+## Building and releasing
+
+```bash
+bash build-xpi.sh   # produces better-find-full-text.xpi
+```
+
+`.github/workflows/build.yml` builds the XPI on every push and attaches it to the
+GitHub release when a `v*` tag is pushed. Bump `version` in `manifest.json` and add a
+matching entry to `updates.json` (with its `update_link` and an `applications.zotero`
+block) — the workflow refuses a tag whose version, manifest and update manifest
+disagree, and checks the built archive for the files it must contain. Zotero reads
+`updates.json` from `main` to offer in-app updates.
+
+```bash
+git tag vX.Y.Z && git push origin vX.Y.Z
+```

@@ -1,0 +1,104 @@
+name: Build XPI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  XPI: better-find-full-text.xpi
+  ADDON_ID: better-find-full-text@example.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from manifest
+        id: manifest
+        run: |
+          jq empty manifest.json
+          jq empty updates.json
+          version=$(jq -r .version manifest.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "manifest version: $version"
+
+      # A tag is what users install from, so refuse to publish one whose version,
+      # manifest and update manifest disagree — Zotero offers an update only when
+      # updates.json advertises a version above the installed one, at a link that
+      # resolves.
+      - name: Check tag agrees with manifest.json and updates.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          fail=0
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match manifest version $VERSION (expected v$VERSION)"
+            fail=1
+          fi
+          entry=$(jq -r --arg id "$ADDON_ID" --arg v "$VERSION" \
+            '.addons[$id].updates | map(select(.version == $v)) | last // empty' updates.json)
+          if [ -z "$entry" ]; then
+            echo "::error::updates.json has no entry for version $VERSION"
+            fail=1
+          else
+            link=$(printf '%s' "$entry" | jq -r .update_link)
+            expected="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$XPI"
+            if [ "$link" != "$expected" ]; then
+              echo "::error::updates.json update_link is $link, expected $expected"
+              fail=1
+            fi
+            maxver=$(printf '%s' "$entry" | jq -r '.applications.zotero.strict_max_version // empty')
+            manifest_maxver=$(jq -r '.applications.zotero.strict_max_version' manifest.json)
+            if [ -n "$maxver" ] && [ "$maxver" != "$manifest_maxver" ]; then
+              echo "::error::updates.json strict_max_version $maxver != manifest $manifest_maxver"
+              fail=1
+            fi
+          fi
+          update_url=$(jq -r '.applications.zotero.update_url' manifest.json)
+          if [ "$update_url" != "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/updates.json" ]; then
+            echo "::error::manifest update_url $update_url does not point at this repo's updates.json"
+            fail=1
+          fi
+          exit $fail
+
+      - name: Build XPI
+        run: bash build-xpi.sh
+
+      # Check the archive rather than trusting the zip line in build-xpi.sh: a
+      # missing icon or script is invisible until someone installs the result.
+      - name: Verify XPI contents
+        run: |
+          contents=$(unzip -Z1 "$XPI")
+          echo "$contents"
+          fail=0
+          for f in manifest.json bootstrap.js better-find-full-text.js content/icons/favicon.svg content/preferences.xhtml; do
+            printf '%s\n' "$contents" | grep -qxF "$f" || { echo "::error::$f missing from XPI"; fail=1; }
+          done
+          exit $fail
+
+      - name: Upload XPI as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-${{ steps.manifest.outputs.version }}
+          path: ${{ env.XPI }}
+          if-no-files-found: error
+
+      - name: Attach XPI to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$XPI" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$XPI" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi
