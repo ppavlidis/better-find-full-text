@@ -53,10 +53,12 @@ var BetterFindFullText = {
 		this.version = version;
 		this.rootURI = rootURI;
 		this._registerNotifier();
+		this._registerEndpoint();
 	},
 
 	destroy() {
 		this._unregisterNotifier();
+		this._unregisterEndpoint();
 		for (const { timer } of this._pendingMerges.values()) {
 			clearTimeout(timer);
 		}
@@ -161,6 +163,37 @@ var BetterFindFullText = {
 		return s.length <= max ? s : s.slice(0, max - 1) + "…";
 	},
 
+	// NCBI's PMC ID Converter. The old host
+	// (www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/) now answers 301 to this one,
+	// so requests still land, but only for as long as NCBI keeps the redirect.
+	NCBI_IDCONV_URL: "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/",
+
+	// Build an ID Converter request.
+	//
+	// NCBI asks callers to identify themselves with `tool` and `email` so they can
+	// warn a heavy user before throttling them. That is the whole purpose of the
+	// address, which is why this sends none unless the user supplied one: an
+	// invented @example.com address cannot receive the warning, so it satisfies
+	// the form of the request while defeating its point. Omitting it is honest and
+	// costs nothing functionally — the service answers normally and merely notes
+	// `query param \`email\` is missing.` in response.request.warnings.
+	//
+	// There is deliberately no api_key. The ID Converter does not accept one: a
+	// key passed here is dropped so completely that it is absent from the request
+	// the service echoes back (verified against the live API, and the endpoint's
+	// documented parameter list has no api_key). Only E-utilities honours keys,
+	// and this plugin calls no E-utilities endpoint.
+	_idConverterUrl(pmid) {
+		const params = [
+			`ids=${encodeURIComponent(pmid)}`,
+			"format=json",
+			"tool=better-find-full-text",
+		];
+		const email = this._getStringPref("ncbiEmail");
+		if (email) params.push(`email=${encodeURIComponent(email)}`);
+		return `${this.NCBI_IDCONV_URL}?${params.join("&")}`;
+	},
+
 	// Read an integer plugin pref (full branch name = PREFS_PREFIX + key),
 	// returning the default when unset or unparseable.
 	_getIntPref(key, dflt) {
@@ -168,6 +201,17 @@ var BetterFindFullText = {
 			const v = Zotero.Prefs.get(this.PREFS_PREFIX + key, true);
 			const n = parseInt(v, 10);
 			return Number.isFinite(n) ? n : dflt;
+		} catch (e) {
+			return dflt;
+		}
+	},
+
+	// Read a string plugin pref (full branch name = PREFS_PREFIX + key),
+	// returning the default when unset, blank, or non-string.
+	_getStringPref(key, dflt = "") {
+		try {
+			const v = Zotero.Prefs.get(this.PREFS_PREFIX + key, true);
+			return typeof v === "string" && v.trim() ? v.trim() : dflt;
 		} catch (e) {
 			return dflt;
 		}
@@ -248,15 +292,174 @@ var BetterFindFullText = {
 
 	// ── Command handler ───────────────────────────────────────────────────────
 
+	// ── HTTP endpoint ─────────────────────────────────────────────────────────
+
+	ENDPOINT_PATH: "/better-find-full-text/run",
+
+	/**
+	 * Register `POST /better-find-full-text/run` on Zotero's own HTTP server
+	 * (127.0.0.1:23119 — localhost-only, the same server the Connector uses).
+	 *
+	 * 🛑 Zotero 10 hardened this server. A request whose User-Agent starts with
+	 * `Mozilla/`, or that carries ANY Origin header, is dropped with no response at
+	 * all unless it also sends a `Zotero-Allowed-Request` header. That check used to
+	 * apply only to CORS-simple content types, so this JSON POST was previously
+	 * exempt and is not any more. curl and other script callers are unaffected;
+	 * anything browser-shaped must send the header:
+	 *
+	 *   curl -H 'Zotero-Allowed-Request: 1' -H 'Content-Type: application/json' \
+	 *        -d '{"collection":"Inbox"}' http://127.0.0.1:23119/better-find-full-text/run
+	 *
+	 * A silent drop is indistinguishable from Zotero not running, so check this
+	 * before debugging anything else. The endpoint deliberately does NOT set
+	 * `allowRequestsFromUnsafeWebContent = true`, which would opt out of the check
+	 * and let any page you visit drive fetching into your library.
+	 *
+	 * Why an endpoint and not a CLI: the fetch pipeline needs a live Zotero with
+	 * the library open, the hidden browser for snapshots, and the Connector
+	 * auto-merge notifier. All of that exists only inside the running app, so
+	 * the entry point has to be in-process. Zotero.Server is how a plugin gets
+	 * one without shipping a second IPC mechanism.
+	 *
+	 * Body (JSON), any one of:
+	 *   { "keys": ["ABCD1234", ...] }        explicit item keys
+	 *   { "collection": "name or key" }      every top-level item in it
+	 *   { "libraryID": 1 }                   optional, defaults to My Library
+	 * Options:
+	 *   { "force": false }                   as the force-retry menu entry
+	 *   { "limit": 0 }                       cap the batch (0 = no cap)
+	 *   { "openPaywalled": true }            false = do not launch browser tabs;
+	 *                                        the URLs come back in the response
+	 *   { "dryRun": false }                  true = resolve and report, fetch nothing
+	 */
+	_registerEndpoint() {
+		try {
+			if (!Zotero.Server || !Zotero.Server.Endpoints) {
+				log("Zotero.Server unavailable — no HTTP entry point registered");
+				return;
+			}
+			const self = this;
+			const Endpoint = function () {};
+			Endpoint.prototype = {
+				supportedMethods: ["POST"],
+				supportedDataTypes: ["application/json"],
+				init: async function (options) {
+					try {
+						return await self._handleRequest(options && options.data || {});
+					} catch (e) {
+						log(`Endpoint error: ${e}`);
+						return [500, "application/json",
+							JSON.stringify({ ok: false, error: String(e) })];
+					}
+				},
+			};
+			Zotero.Server.Endpoints[this.ENDPOINT_PATH] = Endpoint;
+			log(`Registered ${this.ENDPOINT_PATH}`);
+		} catch (e) {
+			log(`Could not register endpoint: ${e}`);
+		}
+	},
+
+	_unregisterEndpoint() {
+		try {
+			if (Zotero.Server && Zotero.Server.Endpoints) {
+				delete Zotero.Server.Endpoints[this.ENDPOINT_PATH];
+			}
+		} catch (e) {
+			log(`Could not unregister endpoint: ${e}`);
+		}
+	},
+
+	async _handleRequest(body) {
+		const libraryID = body.libraryID || Zotero.Libraries.userLibraryID;
+		let items = [];
+
+		if (Array.isArray(body.keys) && body.keys.length) {
+			for (const key of body.keys) {
+				const it = Zotero.Items.getByLibraryAndKey(libraryID, key);
+				if (it) items.push(it);
+			}
+		} else if (body.collection) {
+			// Accept a collection KEY or its NAME — a caller reading the local
+			// SQLite has the numeric id, a caller using the Web API has the
+			// 8-char key, and a human has neither. Name lookup is exact and
+			// case-insensitive; ambiguity is an error rather than a guess.
+			let coll = Zotero.Collections.getByLibraryAndKey(libraryID, body.collection);
+			if (!coll) {
+				const want = String(body.collection).toLowerCase();
+				const hits = Zotero.Collections.getByLibrary(libraryID, true)
+					.filter(c => c.name.toLowerCase() === want);
+				if (hits.length > 1) {
+					return [400, "application/json", JSON.stringify({
+						ok: false,
+						error: `collection name "${body.collection}" is ambiguous`,
+						keys: hits.map(c => c.key),
+					})];
+				}
+				coll = hits[0];
+			}
+			if (!coll) {
+				return [404, "application/json", JSON.stringify({
+					ok: false, error: `no such collection: ${body.collection}` })];
+			}
+			items = coll.getChildItems();
+		} else {
+			return [400, "application/json", JSON.stringify({
+				ok: false, error: "supply `keys` (array) or `collection`" })];
+		}
+
+		items = items.filter(it => it && !it.isAttachment() && !it.isNote());
+		const limit = parseInt(body.limit, 10) || 0;
+		const capped = limit > 0 && items.length > limit;
+		if (capped) items = items.slice(0, limit);
+
+		if (body.dryRun) {
+			// 🛑 Say what was DROPPED. A silent cap reads as "covered everything".
+			return [200, "application/json", JSON.stringify({
+				ok: true, dryRun: true, resolved: items.length, capped,
+				items: items.map(it => ({ key: it.key, title: it.getDisplayTitle() })),
+			})];
+		}
+
+		const res = await this.runForItems(items, {
+			force: !!body.force,
+			openPaywalled: body.openPaywalled !== false,
+		});
+		if (capped) res.capped = true;
+		return [200, "application/json", JSON.stringify(res)];
+	},
+
 	async _onMenuCommand(window, { force = false } = {}) {
 		const items = window.ZoteroPane.getSelectedItems()
 			.filter(it => !it.isAttachment() && !it.isNote());
+		return this.runForItems(items, { force });
+	},
 
-		if (!items.length) return;
+	// ── Programmatic entry point ──────────────────────────────────────────────
+
+	/**
+	 * Run the same batch the context menu runs, over an explicit item list.
+	 *
+	 * Extracted from `_onMenuCommand` rather than duplicated: `window` was only
+	 * ever used to read the selection, so everything below that line is already
+	 * selection-agnostic. A second copy of this loop would drift from the menu
+	 * path, and the batch invariants below are the ones that must not regress.
+	 *
+	 * `openPaywalled: false` runs the fetch but does NOT call `Zotero.launchURL`
+	 * on the paywalled ones — for callers driving a large batch that do not want
+	 * fifty browser tabs at once. The URLs come back in the return value so the
+	 * caller can open them in its own time.
+	 *
+	 * Returns a tally object (also the HTTP endpoint's response body).
+	 */
+	async runForItems(items, { force = false, openPaywalled = true } = {}) {
+		items = (items || []).filter(it => it && !it.isAttachment() && !it.isNote());
+
+		if (!items.length) return { ok: true, processed: 0, note: "no items" };
 
 		if (this._running) {
 			log("A batch is already running — ignoring second invocation");
-			return;
+			return { ok: false, error: "a batch is already running" };
 		}
 		this._running = true;
 		this._cancelRequested = false;
@@ -363,7 +566,7 @@ var BetterFindFullText = {
 		// Open all paywalled URLs in the browser and show a persistent (non-modal,
 		// non-blocking) progress window. It stays until the user dismisses it so
 		// Zotero never steals focus away from the browser.
-		if (paywalled.length) {
+		if (paywalled.length && openPaywalled) {
 			for (const { url } of paywalled) Zotero.launchURL(url);
 		}
 
@@ -394,6 +597,16 @@ var BetterFindFullText = {
 		this._fixProgressWindow();
 		setTimeout(() => this._fixProgressWindow(), 150);
 		pw.startCloseTimer(paywalled.length ? 12000 : 4000);
+
+		return {
+			ok: true, cancelled, processed, total: items.length,
+			pdf: nPdf, snapshot: nSnapshot, paywall: nPaywall,
+			skipped: nSkipped, failed: nFailed, clobbered: nClobbered,
+			openedInBrowser: openPaywalled ? paywalled.length : 0,
+			paywalledUrls: paywalled.map(({ item, url }) => ({
+				key: item.key, title: item.getDisplayTitle(), url,
+			})),
+		};
 	},
 
 	// ── Per-item logic ────────────────────────────────────────────────────────
@@ -824,10 +1037,12 @@ var BetterFindFullText = {
 		// record at all — typical for very recent PMIDs not yet ingested
 		// into EuropePMC's index.
 		if (ids.pmid && !ids.doi && !ids.pmcid) {
-			const lookupUrl = `https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids=${encodeURIComponent(ids.pmid)}&format=json&tool=better-find-full-text&email=better-find-full-text@example.com`;
+			const lookupUrl = this._idConverterUrl(ids.pmid);
 			try {
 				const xhr = await Zotero.HTTP.request("GET", lookupUrl, { timeout: 12000 });
 				const json = JSON.parse(xhr.responseText || "{}");
+				const warnings = json.request?.warnings;
+				if (warnings?.length) log(`NCBI ID converter: ${warnings.join(" ")}`);
 				const rec = (json.records || [])[0] || {};
 				if (rec.pmcid) ids.pmcid = String(rec.pmcid).toUpperCase();
 				if (rec.doi)   ids.doi   = String(rec.doi);

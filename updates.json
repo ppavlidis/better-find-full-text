@@ -31,6 +31,16 @@
 							"strict_max_version": "10.*"
 						}
 					}
+				},
+				{
+					"version": "1.3.0",
+					"update_link": "https://github.com/ppavlidis/better-find-full-text/releases/download/v1.3.0/better-find-full-text.xpi",
+					"applications": {
+						"zotero": {
+							"strict_min_version": "7.0.0",
+							"strict_max_version": "10.*"
+						}
+					}
 				}
 			]
 		}

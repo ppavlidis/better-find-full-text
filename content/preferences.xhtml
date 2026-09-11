@@ -19,5 +19,26 @@
 			the whole batch. Leave blank to use the default of 60 seconds. Raise it
 			if you regularly pull large PDFs over a slow institutional proxy.
 		</description>
+
+		<separator/>
+
+		<hbox align="center">
+			<label flex="1" control="bfft-ncbiEmail">
+				Contact email for NCBI
+			</label>
+			<html:input id="bfft-ncbiEmail"
+				type="email" style="width: 18em;"
+				placeholder="you@example.edu"
+				preference="extensions.better-find-full-text.ncbiEmail" />
+		</hbox>
+
+		<description class="bfft-help">
+			Optional. When a PubMed ID has no DOI attached, this plugin asks NCBI's
+			PMC ID Converter to fill it in. NCBI asks tools to supply a contact
+			address so they can warn a heavy user before throttling them, so the only
+			address worth sending is one you actually read. Leave this blank and no
+			address is sent at all; the lookup still works. No API key is needed or
+			accepted here.
+		</description>
 	</groupbox>
 </vbox>

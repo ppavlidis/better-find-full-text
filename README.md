@@ -96,6 +96,62 @@ Getting full text reliably is an intrinsically hard problem. The plugin does wha
 
 Think of the plugin as a force multiplier for the normal Zotero + Connector workflow, not a guaranteed-success tool. It converts the common cases into one click, and routes the hard cases to a workflow that's one click away from success when you have access.
 
+## HTTP endpoint
+
+The same batch the context menu runs can be driven over Zotero's own local HTTP
+server, so Zotero must be running with the library open.
+
+```
+POST http://127.0.0.1:23119/better-find-full-text/run
+Content-Type: application/json
+```
+
+Supply either `keys` or `collection`:
+
+| Field | Meaning |
+|---|---|
+| `keys` | Array of item keys |
+| `collection` | Collection key, or its name (exact, case-insensitive; an ambiguous name is a 400 rather than a guess) |
+| `libraryID` | Optional; defaults to My Library |
+| `force` | Retry items already marked as tried, as the force-retry menu entry does |
+| `limit` | Cap the batch; `0` means no cap. A capped response sets `capped: true` |
+| `openPaywalled` | `false` runs the fetch but launches no browser tabs — the URLs come back in `paywalledUrls` instead |
+| `dryRun` | `true` resolves and reports what it would do, fetching nothing |
+
+The response is the same tally the menu command produces: `ok`, `processed`, `total`,
+`pdf`, `snapshot`, `paywall`, `skipped`, `failed`, `clobbered`, `openedInBrowser`, and
+`paywalledUrls`.
+
+> **Zotero 10 requires an extra header for browser-shaped callers.** Zotero 10 drops any
+> request whose `User-Agent` starts with `Mozilla/`, or that carries an `Origin` header,
+> **with no response at all** unless it also sends `Zotero-Allowed-Request`. A silent
+> drop looks exactly like Zotero not running, so check this first. `curl` and other
+> script callers are unaffected; the header is harmless to send always.
+
+```bash
+curl -H 'Zotero-Allowed-Request: 1' -H 'Content-Type: application/json' \
+     -d '{"collection":"Inbox","limit":25,"openPaywalled":false}' \
+     http://127.0.0.1:23119/better-find-full-text/run
+```
+
+## Settings
+
+**Zotero → Settings → Better Find Full Text**
+
+| Setting | Default | What it does |
+|---|---|---|
+| Per-item timeout | 60 s | Ceiling on one item before the batch moves on. A hung download can't be cancelled mid-flight, so this stops one bad item stalling everything. |
+| Contact email for NCBI | *(blank)* | Sent as the `email` parameter when asking NCBI's PMC ID Converter to backfill a DOI for a PubMed ID. |
+
+The NCBI address is optional and blank by default. NCBI asks tools for a contact
+address so they can warn a heavy user before throttling them, which means the only
+address worth sending is one you actually read — so when this is blank the plugin
+sends no address at all rather than a made-up one. The lookup works either way; NCBI
+just notes the omission in its response, which the plugin writes to the debug log.
+
+No API key is involved: the ID Converter doesn't accept one, and it's the only NCBI
+API this plugin calls.
+
 ## Requirements
 
 - Zotero 7.0, 8.x, 9.x, or 10.x

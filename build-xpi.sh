@@ -9,7 +9,7 @@ cd "$PLUGIN_DIR"
 # zip appends to an existing archive, so a stale XPI would keep files that have
 # since been renamed or deleted. Start from nothing every time.
 rm -f "$OUT"
-zip -r "$OUT" manifest.json bootstrap.js better-find-full-text.js content/ \
+zip -r "$OUT" manifest.json bootstrap.js better-find-full-text.js prefs.js content/ \
 	-x '*.DS_Store'
 
 echo "Built: $OUT"

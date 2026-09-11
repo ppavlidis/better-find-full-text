@@ -79,7 +79,7 @@ jobs:
           contents=$(unzip -Z1 "$XPI")
           echo "$contents"
           fail=0
-          for f in manifest.json bootstrap.js better-find-full-text.js content/icons/favicon.svg content/preferences.xhtml; do
+          for f in manifest.json bootstrap.js better-find-full-text.js prefs.js content/icons/favicon.svg content/preferences.xhtml; do
             printf '%s\n' "$contents" | grep -qxF "$f" || { echo "::error::$f missing from XPI"; fail=1; }
           done
           exit $fail
